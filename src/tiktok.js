@@ -1,5 +1,32 @@
 const { chromium } = require('playwright');
 const { HEADLESS } = require('./config');
+const fs = require('fs');
+const path = require('path');
+
+// Garantir que a pasta de logs exista
+const LOGS_DIR = path.join(__dirname, '../logs');
+if (!fs.existsSync(LOGS_DIR)) {
+  fs.mkdirSync(LOGS_DIR, { recursive: true });
+}
+
+// Função para escrever logs para arquivo
+function writeLog(message, type = 'info') {
+  const timestamp = new Date().toISOString();
+  const logMessage = `[${timestamp}] [${type.toUpperCase()}] ${message}\n`;
+  
+  // Logs no console
+  console.log(logMessage);
+  
+  // Salvar em arquivo
+  const logFile = path.join(LOGS_DIR, `tiktok-${new Date().toISOString().split('T')[0]}.log`);
+  fs.appendFileSync(logFile, logMessage);
+  
+  // Se for erro, salvar no arquivo de erros
+  if (type === 'error') {
+    const errorLogFile = path.join(LOGS_DIR, 'errors.log');
+    fs.appendFileSync(errorLogFile, logMessage);
+  }
+}
 
 /**
  * Executa ações no TikTok após injetar os cookies
@@ -8,21 +35,36 @@ const { HEADLESS } = require('./config');
  */
 async function performTikTokActions(cookieData) {
   let browser = null;
+  let debugData = {
+    pageContent: null,
+    pageUrl: null,
+    cookiesInjected: [],
+    elements: {
+      videos: 0,
+      buttons: 0,
+      likeBtnFound: false
+    },
+    captchaDetected: false,
+    errors: []
+  };
   
   try {
-    console.log('Iniciando navegador com configuração balanceada...');
+    writeLog('Iniciando navegador com configuração para Linux/Server...');
     
-    // Configurações menos agressivas para navegação
+    // Configurações otimizadas para servidores Linux
     browser = await chromium.launch({ 
       headless: HEADLESS,
       args: [
         '--disable-blink-features=AutomationControlled',
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-infobars',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
         '--window-size=1366,768',
-        '--disable-extensions',
-        '--disable-dev-shm-usage'
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--disable-infobars'
       ]
     });
     
@@ -34,21 +76,45 @@ async function performTikTokActions(cookieData) {
       timezoneId: 'America/Sao_Paulo',
       deviceScaleFactor: 1,
       isMobile: false,
-      acceptDownloads: true
+      acceptDownloads: true,
+      bypassCSP: true
     });
     
-    // Script simplificado para ocultar automação
+    // Script para evadir detecção
     await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => false
-      });
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
       delete navigator.__proto__.webdriver;
+      
+      // Prevenir detecção de headless
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' 
+          ? Promise.resolve({ state: Notification.permission }) 
+          : originalQuery(parameters)
+      );
     });
     
     const page = await context.newPage();
     
+    // Interceptar requests para detectar problemas
+    await page.route('**/*', async (route, request) => {
+      const url = request.url();
+      
+      // Verificar por URLs de verificação/captcha
+      if (url.includes('captcha') || 
+          url.includes('verify') || 
+          url.includes('security') || 
+          url.includes('check')) {
+        debugData.captchaDetected = true;
+        writeLog(`Possível captcha/verificação detectado em: ${url}`, 'warn');
+      }
+      
+      // Continuar com a requisição
+      await route.continue();
+    });
+    
     // Configurar cookies
-    console.log('Injetando cookies...');
+    writeLog('Injetando cookies...');
     
     // Extrair session_id e outros cookies
     const sessionId = cookieData.sessionId || cookieData.session_id;
@@ -96,50 +162,88 @@ async function performTikTokActions(cookieData) {
     
     // Configurar todos os cookies
     await page.context().addCookies(cookiesToAdd);
+    debugData.cookiesInjected = cookiesToAdd.map(c => c.name);
+    writeLog(`Cookies injetados: ${debugData.cookiesInjected.join(', ')}`);
     
-    // Tentar acessar TikTok diretamente pela página For You
-    console.log('Acessando TikTok...');
-    await page.goto('https://www.tiktok.com/', { 
-      waitUntil: 'domcontentloaded', 
-      timeout: 60000 
-    });
+    // Tentar acessar TikTok 
+    writeLog('Acessando TikTok...');
+    try {
+      await page.goto('https://www.tiktok.com/', { 
+        waitUntil: 'domcontentloaded', 
+        timeout: 60000 
+      });
+    } catch (e) {
+      writeLog(`Erro ao acessar TikTok: ${e.message}`, 'error');
+      debugData.errors.push(`Falha ao acessar TikTok: ${e.message}`);
+    }
     
-    // Aguardar carregamento inicial
-    await page.waitForTimeout(8000);
-    
-    // Tirar screenshot da página inicial
-    await page.screenshot({ path: 'tiktok-inicial.png', fullPage: true });
-    
-    // Navegar para For You
-    console.log('Navegando para a página For You...');
-    await page.goto('https://www.tiktok.com/foryou', { 
-      waitUntil: 'domcontentloaded', 
-      timeout: 60000 
-    });
-    
-    // Aguardar mais tempo para garantir carregamento completo
-    await page.waitForTimeout(10000);
-    
-    // Tirar screenshot da página For You
-    await page.screenshot({ path: 'foryou-carregado.png', fullPage: true });
-    
-    // Verificar se está logado
-    const isLoggedIn = await checkLoggedInStatus(page);
-    if (!isLoggedIn) {
-      console.log('Falha ao fazer login com os cookies fornecidos');
-      await page.screenshot({ path: 'login-falhou.png', fullPage: true });
-      console.log('Screenshot salvo como login-falhou.png');
+    // Verificar se há captcha após carregamento inicial
+    const isCaptchaPresent = await checkForCaptcha(page);
+    if (isCaptchaPresent) {
+      debugData.captchaDetected = true;
+      writeLog('Captcha detectado na página inicial!', 'error');
+      // Salvar conteúdo HTML para debug
+      debugData.pageContent = await page.content();
       return { 
         success: false, 
-        message: 'Não foi possível fazer login com os cookies fornecidos'
+        captchaDetected: true, 
+        message: 'Captcha detectado na página. Tente novamente mais tarde ou use outro IP.',
+        debugData
       };
     }
     
-    console.log('Login bem-sucedido!');
-    await page.screenshot({ path: 'login-sucesso.png', fullPage: true });
+    // Salvar estado atual da navegação
+    debugData.pageUrl = page.url();
+    
+    // Navegar para For You
+    writeLog('Navegando para a página For You...');
+    try {
+      await page.goto('https://www.tiktok.com/foryou', { 
+        waitUntil: 'domcontentloaded', 
+        timeout: 60000 
+      });
+    } catch (e) {
+      writeLog(`Erro ao navegar para For You: ${e.message}`, 'error');
+      debugData.errors.push(`Falha ao acessar For You: ${e.message}`);
+    }
+    
+    // Verificar novamente por captcha
+    if (await checkForCaptcha(page)) {
+      debugData.captchaDetected = true;
+      writeLog('Captcha detectado na página For You!', 'error');
+      debugData.pageContent = await page.content();
+      return { 
+        success: false, 
+        captchaDetected: true,
+        message: 'Captcha detectado. Tente novamente mais tarde ou use outro IP.',
+        debugData
+      };
+    }
+    
+    // Coletar informações sobre os elementos na página
+    debugData.elements = await collectPageElementsInfo(page);
+    
+    // Verificar se está logado
+    const loginResult = await checkLoggedInStatus(page);
+    debugData.isLoggedIn = loginResult.isLoggedIn;
+    debugData.loginCheckMethod = loginResult.method;
+    
+    if (!loginResult.isLoggedIn) {
+      writeLog('Falha ao fazer login com os cookies fornecidos', 'error');
+      debugData.pageContent = await page.content();
+      debugData.pageUrl = page.url();
+      return { 
+        success: false, 
+        message: 'Não foi possível fazer login com os cookies fornecidos',
+        loginCheckMethod: loginResult.method,
+        debugData
+      };
+    }
+    
+    writeLog('Login bem-sucedido pelo método: ' + loginResult.method);
     
     // Tentar garantir que a interface seja carregada corretamente
-    console.log('Aguardando carregamento completo dos vídeos...');
+    writeLog('Aguardando carregamento completo dos vídeos...');
     try {
       // Tentar rolar a página para carregar mais conteúdo
       await page.evaluate(() => {
@@ -147,49 +251,160 @@ async function performTikTokActions(cookieData) {
         setTimeout(() => window.scrollBy(0, -100), 1000);
       });
       
-      await page.waitForTimeout(5000);
+      // Avaliar o conteúdo da página
+      debugData.elements = await collectPageElementsInfo(page);
+      writeLog(`Elementos na página: ${JSON.stringify(debugData.elements)}`);
       
-      // Recarregar a página se necessário para garantir carregamento correto
-      const hasContent = await page.evaluate(() => {
-        return document.querySelectorAll('video').length > 0;
-      });
-      
-      if (!hasContent) {
-        console.log('Recarregando página para tentar carregar vídeos...');
+      if (debugData.elements.videos === 0) {
+        writeLog('Nenhum vídeo encontrado. Tentando recarregar...', 'warn');
         await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(8000);
-        await page.screenshot({ path: 'pagina-recarregada.png', fullPage: true });
+        await page.waitForTimeout(5000);
+        
+        // Coletar novamente as informações da página
+        debugData.elements = await collectPageElementsInfo(page);
+        writeLog(`Após recarregar: ${JSON.stringify(debugData.elements)}`);
       }
     } catch (e) {
-      console.log('Erro ao tentar garantir carregamento:', e.message);
+      writeLog('Erro ao tentar garantir carregamento: ' + e.message, 'error');
+      debugData.errors.push(`Falha ao carregar feed: ${e.message}`);
+    }
+    
+    // Se chegamos até aqui e não detectamos vídeos, pode ser um problema
+    if (debugData.elements.videos === 0) {
+      writeLog('Interface carregada sem vídeos, possível erro de versão do browser', 'error');
+      debugData.pageContent = await page.content();
+      // Coletamos um fragmento do HTML para diagnóstico
+      const htmlFragment = await page.evaluate(() => {
+        return document.body.innerHTML.substring(0, 5000); // Primeiros 5000 caracteres
+      });
+      debugData.htmlFragment = htmlFragment;
+      
+      return {
+        success: false,
+        message: 'Interface carregada com sucesso, mas nenhum vídeo encontrado',
+        loggedIn: true,
+        debugData
+      };
     }
     
     // Curtir o primeiro vídeo da página For You
+    writeLog('Tentando curtir o primeiro vídeo...');
     const likeResult = await likeFirstVideo(page);
+    debugData.likeResult = likeResult;
     
-    // Manter navegador aberto por um tempo para debug
-    console.log('Mantendo navegador aberto para debug...');
-    await page.waitForTimeout(60000); // 1 minuto
+    // Coletar informações finais da página
+    debugData.finalUrl = page.url();
     
     return {
-      success: true,
+      success: likeResult.success,
       loggedIn: true,
       actions: {
         like: likeResult
-      }
+      },
+      debugData: debugData
     };
     
   } catch (error) {
-    console.error('Erro durante a execução do Playwright:', error);
+    writeLog('Erro durante a execução do Playwright: ' + error.message, 'error');
     return {
       success: false,
-      error: error.message
+      error: error.message,
+      debugData
     };
   } finally {
     if (browser) {
       await browser.close();
-      console.log('Navegador fechado');
+      writeLog('Navegador fechado');
     }
+  }
+}
+
+/**
+ * Verifica se há captcha na página
+ * @param {Page} page - Instância da página do Playwright
+ * @returns {Promise<boolean>} Verdadeiro se captcha for detectado
+ */
+async function checkForCaptcha(page) {
+  try {
+    // Verificar por textos indicando captcha/verificação
+    const pageContent = await page.content();
+    const captchaIndicators = [
+      'captcha',
+      'verify human',
+      'security check',
+      'human verification',
+      'verificação',
+      'bot check',
+      'suspicious activity',
+      'slide to verify',
+      'deslize para verificar',
+      'verificação de segurança',
+      'verificação humana'
+    ];
+    
+    for (const indicator of captchaIndicators) {
+      if (pageContent.toLowerCase().includes(indicator.toLowerCase())) {
+        writeLog(`Captcha detectado: contém texto "${indicator}"`, 'warn');
+        return true;
+      }
+    }
+    
+    // Verificar por elementos típicos de captcha
+    const captchaSelectors = [
+      '.captcha-container',
+      '.captcha',
+      '.verification',
+      '.security-check',
+      '[data-e2e="challenge-stage"]',
+      '.tiktok-captcha',
+      '.verify-container',
+      'canvas.captcha',
+      'iframe[src*="captcha"]',
+      'iframe[src*="verify"]',
+      '.captcha-img'
+    ];
+    
+    for (const selector of captchaSelectors) {
+      const captchaElement = await page.$(selector);
+      if (captchaElement) {
+        writeLog(`Captcha detectado: elemento "${selector}" encontrado`, 'warn');
+        return true;
+      }
+    }
+    
+    return false;
+  } catch (error) {
+    writeLog('Erro ao verificar captcha: ' + error.message, 'error');
+    return false;
+  }
+}
+
+/**
+ * Coleta informações sobre elementos na página
+ * @param {Page} page - Instância da página do Playwright
+ * @returns {Promise<Object>} Informações sobre os elementos
+ */
+async function collectPageElementsInfo(page) {
+  try {
+    return await page.evaluate(() => {
+      return {
+        videos: document.querySelectorAll('video').length,
+        buttons: document.querySelectorAll('button').length,
+        articles: document.querySelectorAll('article').length,
+        divs: document.querySelectorAll('div').length,
+        section: document.querySelectorAll('section').length,
+        mainContent: !!document.querySelector('#main-content-others_homepage'),
+        columnList: !!document.querySelector('#column-list-container'),
+        possibleFeedElements: document.querySelectorAll('[class*="feed"], [class*="video"], [class*="content"]').length
+      };
+    });
+  } catch (error) {
+    writeLog('Erro ao coletar informações dos elementos: ' + error.message, 'error');
+    return {
+      error: error.message,
+      videos: 0,
+      buttons: 0
+    };
   }
 }
 
@@ -200,88 +415,89 @@ async function performTikTokActions(cookieData) {
  */
 async function likeFirstVideo(page) {
   try {
-    console.log('Procurando primeiro vídeo no feed...');
-    
-    // Tirar screenshot antes
-    await page.screenshot({ path: 'feed-inicial.png', fullPage: true });
+    writeLog('Procurando primeiro vídeo no feed...');
     
     // Verificar se há vídeos carregados
     const videosCount = await page.evaluate(() => {
       return document.querySelectorAll('video').length;
     });
     
-    console.log(`Encontrados ${videosCount} vídeos na página`);
+    writeLog(`Encontrados ${videosCount} vídeos na página`);
     
-    if (videosCount === 0) {
-      // Tentar localizar elementos de container de vídeo mesmo sem vídeos
-      console.log('Tentando localizar containers de vídeo...');
-    }
-    
-    // Seletores possíveis para elementos de vídeo no feed (atualizados)
-    const videoSelectors = [
-      // Seletores gerais de vídeos/feed
-      'div[data-e2e="recommend-list-item-container"]',
-      '[data-e2e="recommend-list-item"]',
-      'div.video-feed-item',
-      'div[data-e2e="feed-item"]',
-      '.video-card-container',
-      '.tiktok-feed-item',
-      // Seletores mais específicos
-      'div.tiktok-x6f6za-DivContainer',
-      'div[data-e2e="feed-video"]'
+    // Estratégia para tentar encontrar o primeiro vídeo
+    let firstVideo = null;
+    const strategies = [
+      // Estratégia 1: Seletores específicos para elementos de vídeo
+      async () => {
+        const videoSelectors = [
+          '#column-list-container > article:first-child',
+          'div[data-e2e="recommend-list-item-container"]',
+          '[data-e2e="recommend-list-item"]',
+          'div.video-feed-item',
+          'div[data-e2e="feed-item"]',
+          '.video-card-container',
+          '.tiktok-feed-item',
+          'div.tiktok-x6f6za-DivContainer',
+          'div[data-e2e="feed-video"]'
+        ];
+        
+        for (const selector of videoSelectors) {
+          const videos = await page.$$(selector);
+          if (videos.length > 0) {
+            writeLog(`Vídeo encontrado com seletor: ${selector}`);
+            return videos[0];
+          }
+        }
+        return null;
+      },
+      
+      // Estratégia 2: Encontrar pelo elemento vídeo diretamente e subir para o container
+      async () => {
+        const videos = await page.$$('video');
+        if (videos.length > 0) {
+          writeLog('Vídeo encontrado pelo elemento video');
+          // Encontrar o elemento pai para interagir
+          return await videos[0].evaluateHandle(el => 
+            el.closest('div[class*="video"]') || 
+            el.closest('article') || 
+            el.parentElement
+          );
+        }
+        return null;
+      },
+      
+      // Estratégia 3: Clicar diretamente no feed ou no primeiro item visível
+      async () => {
+        // Tentar encontrar o feed e clicar no centro
+        const feed = await page.$('#column-list-container, #main-content-others_homepage, [class*="feed-container"]');
+        if (feed) {
+          writeLog('Feed encontrado, tentando clicar direto');
+          return feed;
+        }
+        return null;
+      }
     ];
     
-    // Encontrar o primeiro vídeo
-    let firstVideo = null;
-    for (const selector of videoSelectors) {
-      const videos = await page.$$(selector);
-      if (videos.length > 0) {
-        firstVideo = videos[0];
-        console.log(`Primeiro vídeo encontrado com seletor: ${selector}`);
-        
-        // Tirar screenshot do primeiro vídeo encontrado
-        await firstVideo.screenshot({ path: 'primeiro-video.png' });
-        break;
-      }
-    }
-    
-    // Se não encontrou pelos seletores padrão, tente pelo vídeo diretamente
-    if (!firstVideo) {
-      const videos = await page.$$('video');
-      if (videos.length > 0) {
-        // Encontrar o elemento pai para interagir
-        firstVideo = await videos[0].evaluateHandle(el => el.closest('div[class*="video"]') || el.parentElement);
-        console.log('Primeiro vídeo encontrado pelo elemento video');
-      }
+    // Tentar cada estratégia em ordem
+    for (const strategy of strategies) {
+      firstVideo = await strategy();
+      if (firstVideo) break;
     }
     
     if (!firstVideo) {
-      console.log('Nenhum vídeo encontrado na página For You');
-      await page.screenshot({ path: 'nenhum-video-encontrado.png', fullPage: true });
-      
-      // Tentar abrir o modo desktop se estivermos em interface mobile
-      const mobileToDesktopSwitch = await page.$('button[data-e2e="switch-to-desktop"]');
-      if (mobileToDesktopSwitch) {
-        console.log('Detectada interface mobile. Tentando mudar para desktop...');
-        await mobileToDesktopSwitch.click();
-        await page.waitForTimeout(5000);
-        return await likeFirstVideo(page); // Tentar novamente após a mudança
-      }
-      
+      writeLog('Nenhum vídeo encontrado na página For You', 'error');
       return { success: false, message: 'Nenhum vídeo encontrado' };
     }
     
     // Interagir com o vídeo
-    console.log('Clicando no primeiro vídeo...');
+    writeLog('Clicando no primeiro vídeo...');
     await firstVideo.click();
     await page.waitForTimeout(3000);
-    await page.screenshot({ path: 'apos-clicar-video.png', fullPage: true });
     
     // Agora precisamos encontrar e clicar no botão de like
     return await likeCurrentVideo(page);
   } catch (error) {
-    console.error('Erro ao curtir primeiro vídeo:', error);
-    await page.screenshot({ path: 'erro-curtir-primeiro.png', fullPage: true });
+    writeLog('Erro ao curtir primeiro vídeo: ' + error.message, 'error');
     return { success: false, error: error.message };
   }
 }
@@ -293,204 +509,175 @@ async function likeFirstVideo(page) {
  */
 async function likeCurrentVideo(page) {
   try {
-    console.log('Procurando botão de like para o vídeo atual...');
+    writeLog('Procurando botão de like para o vídeo atual...');
     
-    // Tirar screenshot da tela atual
-    await page.screenshot({ path: 'antes-curtir-atual.png', fullPage: true });
-    
-    // Botão de like pode ter diferentes seletores, tentaremos vários
-    const likeButtonSelectors = [
-      // Seletor específico reportado pelo usuário - ALTA PRIORIDADE
-      '#column-list-container > article:nth-child(1) > div > section.css-16g1ej4-SectionActionBarContainer.ees02z00 > button:nth-child(2)',
-      
-      // Variações do seletor específico reportado
-      'article:nth-child(1) > div > section > button:nth-child(2)',
-      'article:first-child > div > section > button:nth-child(2)',
-      'article > div > section > button:nth-child(2)',
-      'section.css-16g1ej4-SectionActionBarContainer > button:nth-child(2)',
-      '.css-16g1ej4-SectionActionBarContainer > button:nth-child(2)',
-      '#column-list-container button:nth-child(2)',
-      
-      // Seletores por atributo data-e2e
-      '[data-e2e="like-icon"]',
-      'span[data-e2e="like-icon"]',
-      '[data-e2e="feed-action-like"]',
-      'button[data-e2e="like-button"]',
-      
-      // Seletores por aria-label
-      'button[aria-label="Like"]',
-      'button[aria-label="Curtir"]',
-      
-      // Seletores por classes (podem mudar com frequência)
-      '.like-button',
-      '.video-like-btn',
-      '.tt-like-button',
-      
-      // Seletores por XPath
-      '//button[contains(@class, "like")]',
-      '//span[contains(@class, "like")]/parent::button',
-      '//div[contains(@class, "like-container")]',
-      '//div[contains(@class, "action-item")]//span[contains(text(), "Like")]/..',
-      '//div[contains(@class, "action-item")]//span[contains(text(), "Curtir")]/..'
-    ];
-    
-    // Tentar encontrar o botão de like
+    // Estratégias para encontrar o botão de like
     let likeButton = null;
-    
-    // Tentar cada seletor
-    for (const selector of likeButtonSelectors) {
-      if (selector.startsWith('//')) {
-        // É um XPath
-        const elements = await page.$x(selector);
-        if (elements.length > 0) {
-          likeButton = elements[0];
-          console.log(`Botão de like encontrado com XPath: ${selector}`);
-          break;
-        }
-      } else {
-        // É um seletor CSS
-        const button = await page.$(selector);
-        if (button) {
-          likeButton = button;
-          console.log(`Botão de like encontrado com CSS: ${selector}`);
-          break;
-        }
-      }
-    }
-    
-    // Se ainda não encontramos, vamos tentar buscar pelo SVG ou ícone de like
-    if (!likeButton) {
-      console.log('Tentando localizar o ícone de like...');
-      
-      // Tentar encontrar pelo ícone do coração ou thumb up
-      const iconSelectors = [
-        'svg[fill="none"][viewBox="0 0 48 48"]',
-        'svg.like-icon',
-        'i.like-icon',
-        'i[class*="like"]',
-        'svg[class*="like"]'
-      ];
-      
-      for (const selector of iconSelectors) {
-        const icon = await page.$(selector);
-        if (icon) {
-          // Tentar encontrar o botão pai
-          likeButton = await icon.evaluateHandle(el => {
-            let current = el;
-            // Subir até 3 níveis para encontrar um botão ou div clicável
-            for (let i = 0; i < 3; i++) {
-              if (!current || !current.parentElement) break;
-              current = current.parentElement;
-              if (current.tagName === 'BUTTON' || 
-                  (current.tagName === 'DIV' && current.getAttribute('role') === 'button')) {
-                return current;
-              }
-            }
-            return current; // retorna o último elemento encontrado
-          });
-          
-          console.log('Botão de like encontrado via ícone');
-          
-          // Tirar screenshot do botão encontrado
-          await likeButton.screenshot({ path: 'botao-like-encontrado.png' }).catch(() => {});
-          break;
-        }
-      }
-    }
-    
-    // Se ainda não encontrou, tente outro método
-    if (!likeButton) {
-      // Tente localizar analisando a estrutura da página
-      console.log('Tentando localizar botões de ação do vídeo...');
-      
-      // Localizar a área de ações do vídeo (geralmente à direita ou embaixo)
-      const actionButtons = await page.$$('div[class*="action"] button');
-      if (actionButtons.length > 0) {
-        // Geralmente o primeiro botão é o like
-        likeButton = actionButtons[0];
-        console.log('Botão de like encontrado na área de ações');
-      }
-    }
-    
-    // Se não encontrou o botão, retornar falha
-    if (!likeButton) {
-      console.log('Botão de like não encontrado');
-      
-      // Tentar uma abordagem específica para o seletor informado
-      console.log('Tentando abordagem direta com o seletor específico...');
-      try {
-        // Usar evaluate para clicar diretamente no elemento pelo seletor específico
-        const clickResult = await page.evaluate(() => {
-          const specificSelector = '#column-list-container > article:nth-child(1) > div > section.css-16g1ej4-SectionActionBarContainer.ees02z00 > button:nth-child(2)';
-          const btn = document.querySelector(specificSelector);
-          if (btn) {
-            btn.click();
-            return true;
+    const strategies = [
+      // Estratégia 1: Seletor específico reportado pelo usuário
+      async () => {
+        const specificSelectors = [
+          '#column-list-container > article:nth-child(1) > div > section.css-16g1ej4-SectionActionBarContainer.ees02z00 > button:nth-child(2)',
+          'article:nth-child(1) > div > section > button:nth-child(2)',
+          'article:first-child > div > section > button:nth-child(2)',
+          'article > div > section > button:nth-child(2)',
+          'section.css-16g1ej4-SectionActionBarContainer > button:nth-child(2)',
+          '.css-16g1ej4-SectionActionBarContainer > button:nth-child(2)',
+          '#column-list-container button:nth-child(2)',
+          'section button:nth-child(2)',
+          '[class*="action"] > button:nth-child(2)'
+        ];
+        
+        for (const selector of specificSelectors) {
+          const button = await page.$(selector);
+          if (button) {
+            writeLog(`Botão de like encontrado com seletor específico: ${selector}`);
+            return button;
           }
-          return false;
+        }
+        return null;
+      },
+      
+      // Estratégia 2: Usar atributos data-e2e
+      async () => {
+        const e2eSelectors = [
+          '[data-e2e="like-icon"]',
+          'span[data-e2e="like-icon"]',
+          '[data-e2e="feed-action-like"]',
+          '[data-e2e="video-like-btn"]',
+          'button[data-e2e="like-button"]'
+        ];
+        
+        for (const selector of e2eSelectors) {
+          const button = await page.$(selector);
+          if (button) {
+            writeLog(`Botão de like encontrado com atributo data-e2e: ${selector}`);
+            return button;
+          }
+        }
+        return null;
+      },
+      
+      // Estratégia 3: Buscar por texto ou aria-label
+      async () => {
+        // Avaliar na página buscando por textos ou aria-labels
+        const button = await page.evaluateHandle(() => {
+          // Buscar por aria-label
+          const ariaButtons = Array.from(document.querySelectorAll('button[aria-label="Like"], button[aria-label="Curtir"]'));
+          if (ariaButtons.length > 0) return ariaButtons[0];
+          
+          // Buscar por botões com texto
+          const allButtons = Array.from(document.querySelectorAll('button'));
+          const likeButton = allButtons.find(btn => {
+            const text = btn.textContent.toLowerCase();
+            return text.includes('like') || text.includes('curtir');
+          });
+          if (likeButton) return likeButton;
+          
+          // Buscar pelo segundo botão em seções de ação (geralmente é o like)
+          const actionSections = Array.from(document.querySelectorAll('section, div[class*="action"]'));
+          for (const section of actionSections) {
+            const buttons = Array.from(section.querySelectorAll('button'));
+            if (buttons.length >= 2) return buttons[1]; // Geralmente o segundo botão é o like
+          }
+          
+          return null;
         });
         
-        if (clickResult) {
-          console.log('Clique realizado via evaluateHandle no seletor específico');
-          await page.waitForTimeout(2000);
-          await page.screenshot({ path: 'apos-clique-seletor-especifico.png', fullPage: true });
-          return { 
-            success: true, 
-            message: 'Tentativa de clique no seletor específico realizada com sucesso' 
-          };
+        // Verificar se encontrou algo
+        const isNull = await page.evaluate(btn => btn === null, button);
+        if (!isNull) {
+          writeLog('Botão de like encontrado por texto ou aria-label');
+          return button;
         }
-      } catch (e) {
-        console.log('Erro ao tentar abordagem direta:', e.message);
-      }
+        return null;
+      },
       
-      // Tentar clicar em um ponto fixo onde geralmente está o botão de like
-      console.log('Tentando clicar no local típico do botão de like...');
-      
-      // O botão de like geralmente está no canto direito em desktop ou embaixo em mobile
-      try {
-        // Obter dimensões da viewport
-        const viewportSize = page.viewportSize();
-        if (viewportSize) {
-          const { width, height } = viewportSize;
-          
-          // Em telas desktop, o like geralmente está à direita
-          if (width > height) {
-            await page.mouse.click(width - 80, height / 2);
-          } else {
-            // Em telas mobile, o like geralmente está embaixo
-            await page.mouse.click(width / 3, height - 100);
+      // Estratégia 4: Abordagem direta via JavaScript para clicar no seletor
+      async () => {
+        // Tentar clicar diretamente via JavaScript
+        const clicked = await page.evaluate(() => {
+          try {
+            // Seletor específico
+            const specificSelector = '#column-list-container > article:nth-child(1) > div > section.css-16g1ej4-SectionActionBarContainer.ees02z00 > button:nth-child(2)';
+            const btn = document.querySelector(specificSelector);
+            if (btn) {
+              btn.click();
+              return true;
+            }
+            
+            // Tentar outros seletores
+            const secondButtons = document.querySelectorAll('section button:nth-child(2)');
+            if (secondButtons.length > 0) {
+              secondButtons[0].click();
+              return true;
+            }
+            
+            return false;
+          } catch (e) {
+            console.error("Erro ao tentar clicar via JS:", e);
+            return false;
           }
-          
-          await page.waitForTimeout(2000);
-          await page.screenshot({ path: 'apos-clique-posicao-fixa.png', fullPage: true });
-          
-          return { 
-            success: true, 
-            message: 'Tentativa de clique em posição fixa realizada' 
-          };
+        });
+        
+        if (clicked) {
+          writeLog('Clique realizado diretamente via JavaScript');
+          return { dummyClick: true };
         }
-      } catch (e) {
-        console.log('Erro ao tentar clique em posição fixa:', e.message);
+        return null;
       }
-      
-      await page.screenshot({ path: 'like-nao-encontrado.png', fullPage: true });
-      return { success: false, message: 'Botão de like não encontrado' };
+    ];
+    
+    // Tentar cada estratégia em ordem
+    for (const strategy of strategies) {
+      likeButton = await strategy();
+      if (likeButton) break;
     }
     
-    // Clicar no botão de like
-    console.log('Clicando no botão de like...');
-    await likeButton.click();
+    // Se encontramos o botão (exceto para a estratégia de clique direto), clicar nele
+    if (likeButton && !likeButton.dummyClick) {
+      writeLog('Clicando no botão de like...');
+      await likeButton.click();
+      await page.waitForTimeout(3000);
+      writeLog('Clique realizado com sucesso!');
+      return { success: true, message: 'Tentativa de curtir realizada com sucesso' };
+    } else if (likeButton && likeButton.dummyClick) {
+      // Se foi a estratégia de clique direto que funcionou
+      return { success: true, message: 'Tentativa de curtir realizada via JavaScript' };
+    }
     
-    // Aguardar para garantir que a ação foi processada
-    await page.waitForTimeout(3000);
+    // Se chegamos aqui, todas as estratégias falharam
+    writeLog('Todas as estratégias para encontrar o botão de like falharam', 'error');
     
-    // Tirar screenshot após o clique
-    await page.screenshot({ path: 'apos-curtir.png', fullPage: true });
+    // Última tentativa - clicar em posição fixa na tela
+    writeLog('Tentando clicar no local típico do botão de like...');
     
-    return { success: true, message: 'Tentativa de curtir realizada com sucesso' };
+    try {
+      const viewportSize = page.viewportSize();
+      if (viewportSize) {
+        const { width, height } = viewportSize;
+        
+        // Em telas desktop, o like geralmente fica à direita
+        if (width > height) {
+          await page.mouse.click(width - 80, height / 2);
+        } else {
+          // Em mobile, o like geralmente fica embaixo
+          await page.mouse.click(width / 3, height - 100);
+        }
+        
+        writeLog('Clique em posição fixa realizado');
+        return { 
+          success: true, 
+          message: 'Tentativa de clique em posição fixa realizada' 
+        };
+      }
+    } catch (e) {
+      writeLog('Erro ao tentar clique em posição fixa: ' + e.message, 'error');
+    }
+    
+    return { success: false, message: 'Botão de like não encontrado' };
   } catch (error) {
-    console.error('Erro ao curtir vídeo:', error);
-    await page.screenshot({ path: 'erro-curtir.png', fullPage: true });
+    writeLog('Erro ao curtir vídeo: ' + error.message, 'error');
     return { success: false, error: error.message };
   }
 }
@@ -498,20 +685,14 @@ async function likeCurrentVideo(page) {
 /**
  * Verifica se o usuário está logado
  * @param {Page} page - Instância da página do Playwright
- * @returns {Promise<boolean>} Status do login
+ * @returns {Promise<{isLoggedIn: boolean, method: string}>} Status do login e método usado para verificação
  */
 async function checkLoggedInStatus(page) {
   try {
-    console.log('Verificando status de login...');
+    writeLog('Verificando status de login...');
     
-    // Esperar para página carregar completamente
-    await page.waitForTimeout(5000);
-    
-    // Tirar screenshot para análise
-    await page.screenshot({ path: 'verificacao-login.png', fullPage: true });
-    
-    // 1. Verificar por elementos de perfil
-    const selectors = [
+    // Método 1: Verificar por elementos de perfil visíveis
+    const profileSelectors = [
       '[data-e2e="profile-icon"]',
       'div[data-e2e="user-info"]',
       'div[data-e2e="user-page"]',
@@ -523,16 +704,15 @@ async function checkLoggedInStatus(page) {
       'button[data-e2e="profile-link"]'
     ];
     
-    // Verificar cada seletor
-    for (const selector of selectors) {
+    for (const selector of profileSelectors) {
       const element = await page.$(selector);
       if (element) {
-        console.log(`Login detectado com seletor: ${selector}`);
-        return true;
+        writeLog(`Login detectado com seletor: ${selector}`);
+        return { isLoggedIn: true, method: `element:${selector}` };
       }
     }
     
-    // 2. Verificar se botão de login NÃO está presente
+    // Método 2: Verificar se botão de login NÃO está presente
     const loginButtons = [
       'button[data-e2e="top-login-button"]',
       'a[href="/login"]',
@@ -550,33 +730,79 @@ async function checkLoggedInStatus(page) {
     }
     
     if (!loginButtonFound) {
-      console.log('Login detectado pela ausência de botões de login');
-      return true;
+      writeLog('Login detectado pela ausência de botões de login');
+      return { isLoggedIn: true, method: 'no-login-buttons' };
     }
     
-    // 3. Última tentativa - verificar URL pessoal ou conteúdo da página
-    try {
-      const url = page.url();
-      if (url.includes('/profile/') || url.includes('/@')) {
-        console.log('Login detectado pela URL do perfil');
+    // Método 3: Verificar URL e conteúdo da página
+    const url = page.url();
+    if (url.includes('/profile/') || url.includes('/@')) {
+      writeLog('Login detectado pela URL do perfil');
+      return { isLoggedIn: true, method: 'profile-url' };
+    }
+    
+    // Método 4: Verificar por texto que indica que o usuário está logado
+    const loggedInByContent = await page.evaluate(() => {
+      // Verificar no HTML/scripts
+      const htmlContent = document.documentElement.innerHTML;
+      if (htmlContent.includes('"isLogin":true') || 
+          htmlContent.includes('"isLoggedIn":true') ||
+          htmlContent.includes('"authenticated":true')) {
         return true;
       }
       
-      // Verificar por texto que indica que o usuário está logado
-      const pageContent = await page.content();
-      if (pageContent.includes('"isLogin":true') || 
-          pageContent.includes('"isLoggedIn":true') ||
-          pageContent.includes('"authenticated":true')) {
-        console.log('Login detectado pelo conteúdo da página');
-        return true;
-      }
-    } catch (e) {}
+      // Verificar em objetos globais
+      try {
+        // Alguns sites armazenam estado de autenticação em objetos globais
+        const globals = [
+          'window.__INITIAL_STATE__',
+          'window.LOGGED_IN',
+          'window.appContext',
+          'window.__USER_DATA__'
+        ];
+        
+        for (const global of globals) {
+          try {
+            const result = eval(global);
+            if (result && typeof result === 'object') {
+              const jsonStr = JSON.stringify(result);
+              if (jsonStr.includes('loggedIn') || 
+                  jsonStr.includes('isLogin') || 
+                  jsonStr.includes('authenticated')) {
+                return true;
+              }
+            }
+          } catch (e) {
+            // Ignorar erros
+          }
+        }
+      } catch (e) {}
+      
+      return false;
+    });
     
-    console.log('Nenhum indicador de login encontrado');
-    return false;
+    if (loggedInByContent) {
+      writeLog('Login detectado pelo conteúdo da página');
+      return { isLoggedIn: true, method: 'page-content' };
+    }
+    
+    // Método 5: Verificar elementos relacionados a usuários logados
+    const loggedInByElements = await page.evaluate(() => {
+      // Verificar por elementos que geralmente aparecem para usuários logados
+      const userElements = document.querySelectorAll('[data-e2e*="profile"], [data-e2e*="user"], .user-info, .profile');
+      return userElements.length > 0;
+    });
+    
+    if (loggedInByElements) {
+      writeLog('Login detectado por elementos relacionados ao usuário');
+      return { isLoggedIn: true, method: 'user-elements' };
+    }
+    
+    writeLog('Nenhum indicador de login encontrado', 'warn');
+    return { isLoggedIn: false, method: 'no-indicators' };
   } catch (error) {
-    console.error('Erro ao verificar status de login:', error);
-    return false;
+    writeLog('Erro ao verificar status de login: ' + error.message, 'error');
+    return { isLoggedIn: false, method: 'error:' + error.message };
   }
 }
 
