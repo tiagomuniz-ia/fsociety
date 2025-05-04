@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.52.0-focal
+FROM mcr.microsoft.com/playwright:v1.40.0-focal
 
 WORKDIR /app
 
@@ -6,8 +6,9 @@ WORKDIR /app
 COPY package*.json ./
 COPY src ./src
 
-# Instalar dependências
+# Instalar dependências e atualizar o Playwright
 RUN npm ci
+RUN npx playwright install chromium
 
 # Expor porta da aplicação
 EXPOSE 3000
